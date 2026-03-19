@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+from dataclasses import dataclass
+from typing import Literal
+
+
+LinkType = Literal["symlink", "hardlink"]
+PathMode = Literal["absolute", "relative"]
+
+
+@dataclass
+class SourceInfo:
+    input_path: Path
+    abs_path: Path
+    exists: bool
+    kind: Literal["missing", "file", "directory", "symlink", "unsupported"]
+    note: str | None = None
+
+
+@dataclass
+class Plan:
+    source_input: Path
+    source_abs: Path
+    source_info: SourceInfo
+    link_path_input: Path
+    link_path_abs: Path
+    link_type: LinkType
+    path_mode: PathMode | None
+    stored_target: str | None
+    resolved_target: str
+    reasoning: list[str]
+    conflict_action: Literal["none", "replace", "backup"]
+    warning: str | None = None
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def path_abs_no_deref(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def path_lexists(path: Path) -> bool:
+    return os.path.lexists(os.fspath(path))
+
+
+def classify_source(path: Path) -> SourceInfo:
+    abs_path = path_abs_no_deref(path)
+
+    if not path_lexists(path):
+        return SourceInfo(
+            input_path=path,
+            abs_path=abs_path,
+            exists=False,
+            kind="missing",
+        )
+
+    try:
+        st = os.lstat(os.fspath(path))
+    except OSError as exc:
+        return SourceInfo(
+            input_path=path,
+            abs_path=abs_path,
+            exists=True,
+            kind="unsupported",
+            note=f"Could not inspect source: {exc}",
+        )
+
+    mode = st.st_mode
+    if stat.S_ISLNK(mode):
+        return SourceInfo(
+            input_path=path,
+            abs_path=abs_path,
+            exists=True,
+            kind="symlink",
+            note="Source is itself a symbolic link.",
+        )
+    if stat.S_ISREG(mode):
+        return SourceInfo(
+            input_path=path,
+            abs_path=abs_path,
+            exists=True,
+            kind="file",
+        )
+    if stat.S_ISDIR(mode):
+        return SourceInfo(
+            input_path=path,
+            abs_path=abs_path,
+            exists=True,
+            kind="directory",
+        )
+
+    return SourceInfo(
+        input_path=path,
+        abs_path=abs_path,
+        exists=True,
+        kind="unsupported",
+        note="Special files are not supported in v1.",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lnk",
+        description=(
+            "Create a symbolic link or hard link using an interactive wizard. "
+            "By default, symlinks are preferred. Hard links are only created "
+            "after explicit user choice in interactive mode."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Run non-interactively where possible. This auto-accepts defaults, "
+            "but does not replace an existing destination unless --replace or "
+            "--backup is also given."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the planned action without changing the filesystem.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace an existing destination without asking.",
+    )
+    parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="Backup an existing destination before replacing it.",
+    )
+    parser.add_argument("from_path", help="Source path")
+    parser.add_argument("to_path", help="Link path to create")
+    return parser
+
+
+def prompt_choice(prompt: str, options: dict[str, str], default: str | None = None) -> str:
+    while True:
+        print(prompt)
+        for key, label in options.items():
+            if key == default:
+                print(f"  {key}. {label} [default]")
+            else:
+                print(f"  {key}. {label}")
+
+        answer = input("> ").strip()
+        if not answer and default is not None:
+            return default
+        if answer in options:
+            return answer
+
+        print("Please enter one of:", ", ".join(options.keys()))
+        print()
+
+
+def prompt_yes_no(question: str, default: bool | None = None) -> bool:
+    suffix = " [y/n]"
+    if default is True:
+        suffix = " [Y/n]"
+    elif default is False:
+        suffix = " [y/N]"
+
+    while True:
+        answer = input(f"{question}{suffix} ").strip().lower()
+        if not answer and default is not None:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def backup_name(path: Path) -> Path:
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return path.with_name(f"{path.name}.bak.{timestamp}")
+
+
+def ensure_parent_exists(path: Path) -> None:
+    parent = path.parent
+    if not parent.exists():
+        raise FileNotFoundError(f"Destination parent does not exist: {parent}")
+    if not parent.is_dir():
+        raise NotADirectoryError(f"Destination parent is not a directory: {parent}")
+
+
+def same_filesystem(source: Path, dest_parent: Path) -> bool:
+    return source.stat().st_dev == dest_parent.stat().st_dev
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        # Covers broken symlink and odd edge cases.
+        os.unlink(os.fspath(path))
+
+
+def destination_status(path: Path) -> str:
+    if not path_lexists(path):
+        return "missing"
+    if path.is_symlink():
+        return "symlink"
+    if path.is_dir():
+        return "directory"
+    if path.is_file():
+        return "file"
+    return "other"
+
+
+def symlink_already_correct(dest: Path, stored_target: str) -> bool:
+    if not dest.is_symlink():
+        return False
+    try:
+        existing = os.readlink(os.fspath(dest))
+    except OSError:
+        return False
+    return existing == stored_target
+
+
+def hardlink_already_correct(dest: Path, source: Path) -> bool:
+    if not path_lexists(dest):
+        return False
+    if dest.is_symlink():
+        return False
+    try:
+        dst_stat = dest.stat()
+        src_stat = source.stat()
+    except OSError:
+        return False
+
+    return (
+        stat.S_ISREG(dst_stat.st_mode)
+        and dst_stat.st_ino == src_stat.st_ino
+        and dst_stat.st_dev == src_stat.st_dev
+    )
+
+
+def explain_source(info: SourceInfo) -> None:
+    print("Detected source:")
+    print(f"  Input path:    {info.input_path}")
+    print(f"  Absolute path: {info.abs_path}")
+    print(f"  Kind:          {info.kind}")
+    if info.note:
+        print(f"  Note:          {info.note}")
+    print()
+
+
+def choose_plan(
+    source_path: Path,
+    link_path: Path,
+    args: argparse.Namespace,
+) -> Plan:
+    source_info = classify_source(source_path)
+    source_abs = source_info.abs_path
+    link_abs = path_abs_no_deref(link_path)
+    reasoning: list[str] = []
+    warning: str | None = None
+
+    ensure_parent_exists(link_abs)
+
+    if source_info.kind == "unsupported":
+        raise ValueError(source_info.note or "Unsupported source type.")
+
+    if source_info.kind == "directory":
+        link_type: LinkType = "symlink"
+        reasoning.append("Source is a directory, so a hard link is not appropriate.")
+    elif source_info.kind == "missing":
+        link_type = "symlink"
+        warning = (
+            "The source does not exist yet. A symbolic link can still be created, "
+            "but it will be broken until the source appears."
+        )
+        reasoning.append("Source is missing, so only a symbolic link is possible.")
+    elif source_info.kind == "symlink":
+        link_type = "symlink"
+        reasoning.append(
+            "Source is itself a symbolic link. In v1, symbolic-link mode keeps using "
+            "the source path you provided."
+        )
+    elif source_info.kind == "file":
+        if args.yes:
+            link_type = "symlink"
+            reasoning.append(
+                "Non-interactive mode defaults regular files to symbolic links."
+            )
+        else:
+            print("How should the new path behave?")
+            choice = prompt_choice(
+                "Choose the behavior you want:",
+                {
+                    "1": "Like a reference or shortcut to the source",
+                    "2": "Like a second name for the same file",
+                },
+                default="1",
+            )
+            if choice == "1":
+                link_type = "symlink"
+                reasoning.append(
+                    "You chose reference-style behavior, so a symbolic link is appropriate."
+                )
+            else:
+                if source_info.kind == "symlink":
+                    raise ValueError(
+                        "Hard-link mode for symlink sources is not supported in v1."
+                    )
+                if not same_filesystem(source_abs, link_abs.parent):
+                    raise ValueError(
+                        "Hard links cannot cross filesystem boundaries. "
+                        "Use a symbolic link instead."
+                    )
+                link_type = "hardlink"
+                reasoning.append(
+                    "You chose second-name behavior, so a hard link is appropriate."
+                )
+    else:
+        raise ValueError("Unhandled source type.")
+
+    path_mode: PathMode | None = None
+    stored_target: str | None = None
+
+    if link_type == "symlink":
+        if args.yes:
+            path_mode = "absolute"
+            reasoning.append(
+                "Non-interactive mode defaults symbolic links to absolute paths."
+            )
+        else:
+            move_together = prompt_yes_no(
+                "Should this link keep working if this folder structure moves together?",
+                default=True,
+            )
+            if move_together:
+                path_mode = "relative"
+                reasoning.append(
+                    "You said the paths may move together, so a relative symlink is appropriate."
+                )
+            else:
+                path_mode = "absolute"
+                reasoning.append(
+                    "You said the paths are anchored, so an absolute symlink is appropriate."
+                )
+
+        if path_mode == "relative":
+            stored_target = os.path.relpath(
+                os.fspath(source_abs),
+                start=os.fspath(link_abs.parent),
+            )
+        else:
+            stored_target = os.fspath(source_abs)
+
+    if link_type == "symlink":
+        resolved_target = os.fspath(source_abs)
+    else:
+        resolved_target = os.fspath(source_abs)
+
+    conflict_action: Literal["none", "replace", "backup"] = "none"
+    if path_lexists(link_abs):
+        if args.backup:
+            conflict_action = "backup"
+        elif args.replace:
+            conflict_action = "replace"
+        elif args.yes:
+            raise FileExistsError(
+                "Destination already exists. Use --replace or --backup with --yes."
+            )
+        else:
+            print()
+            print(f"Destination already exists: {link_abs}")
+            choice = prompt_choice(
+                "What should happen to the existing destination?",
+                {
+                    "1": "Cancel",
+                    "2": "Replace it",
+                    "3": "Backup it, then replace it",
+                },
+                default="1",
+            )
+            if choice == "1":
+                raise KeyboardInterrupt("Cancelled by user.")
+            if choice == "2":
+                conflict_action = "replace"
+            else:
+                conflict_action = "backup"
+
+    return Plan(
+        source_input=source_path,
+        source_abs=source_abs,
+        source_info=source_info,
+        link_path_input=link_path,
+        link_path_abs=link_abs,
+        link_type=link_type,
+        path_mode=path_mode,
+        stored_target=stored_target,
+        resolved_target=resolved_target,
+        reasoning=reasoning,
+        conflict_action=conflict_action,
+        warning=warning,
+    )
+
+
+def equivalent_command(plan: Plan) -> str:
+    if plan.link_type == "symlink":
+        assert plan.stored_target is not None
+        return f"ln -s {shell_quote(plan.stored_target)} {shell_quote(os.fspath(plan.link_path_abs))}"
+    return f"ln {shell_quote(os.fspath(plan.source_abs))} {shell_quote(os.fspath(plan.link_path_abs))}"
+
+
+def shell_quote(text: str) -> str:
+    # Minimal shell-safe quoting without shlex.join dependency on multiple args.
+    import shlex
+    return shlex.quote(text)
+
+
+def print_summary(plan: Plan) -> None:
+    print()
+    print("Planned action")
+    print()
+    print(f"Source input:      {plan.source_input}")
+    print(f"Source absolute:   {plan.source_abs}")
+    print(f"Link path:         {plan.link_path_abs}")
+    print(f"Link type:         {plan.link_type}")
+    if plan.link_type == "symlink":
+        print(f"Path style:        {plan.path_mode}")
+        print(f"Resolved target:   {plan.resolved_target}")
+        print(f"Stored target:     {plan.stored_target}")
+    else:
+        print(f"Resolved target:   {plan.resolved_target}")
+        print("Meaning:           Both names will refer to the same file contents.")
+    print(f"Conflict action:   {plan.conflict_action}")
+    print()
+
+    if plan.warning:
+        print("Warning:")
+        print(f"  {plan.warning}")
+        print()
+
+    print("Why these options were chosen:")
+    for reason in plan.reasoning:
+        print(f"  - {reason}")
+    print()
+
+    print("Equivalent command:")
+    print(f"  {equivalent_command(plan)}")
+    print()
+
+
+def maybe_confirm(plan: Plan, args: argparse.Namespace) -> bool:
+    if args.yes:
+        return True
+    return prompt_yes_no("Proceed with this action?", default=True)
+
+
+def apply_existing_destination_policy(plan: Plan) -> None:
+    dest = plan.link_path_abs
+    if not path_lexists(dest):
+        return
+
+    if plan.conflict_action == "none":
+        raise FileExistsError(f"Destination already exists: {dest}")
+
+    if plan.conflict_action == "backup":
+        backup = backup_name(dest)
+        shutil.move(os.fspath(dest), os.fspath(backup))
+        print(f"Backed up existing destination to: {backup}")
+        return
+
+    if plan.conflict_action == "replace":
+        remove_path(dest)
+        return
+
+    raise RuntimeError(f"Unknown conflict action: {plan.conflict_action}")
+
+
+def create_link(plan: Plan) -> None:
+    if plan.link_type == "symlink":
+        assert plan.stored_target is not None
+        os.symlink(plan.stored_target, os.fspath(plan.link_path_abs))
+    else:
+        os.link(os.fspath(plan.source_abs), os.fspath(plan.link_path_abs))
+
+
+def report_already_correct(plan: Plan) -> bool:
+    dest = plan.link_path_abs
+    if plan.link_type == "symlink":
+        assert plan.stored_target is not None
+        if symlink_already_correct(dest, plan.stored_target):
+            print("Destination is already the intended symbolic link. No changes made.")
+            return True
+        return False
+
+    if hardlink_already_correct(dest, plan.source_abs):
+        print("Destination is already the intended hard link. No changes made.")
+        return True
+    return False
+
+
+def validate_plan(plan: Plan) -> None:
+    if plan.link_type == "hardlink":
+        if plan.source_info.kind != "file":
+            raise ValueError("Hard links are only supported for regular files.")
+        if not plan.source_abs.exists():
+            raise ValueError("Hard links require an existing source file.")
+        if plan.source_info.kind == "symlink":
+            raise ValueError("Hard-link mode for symlink sources is not supported in v1.")
+        if not same_filesystem(plan.source_abs, plan.link_path_abs.parent):
+            raise ValueError("Hard links cannot cross filesystem boundaries.")
+
+    if plan.link_type == "symlink" and plan.path_mode not in {"absolute", "relative"}:
+        raise ValueError("Symlink mode requires a path style.")
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.replace and args.backup:
+        eprint("Choose only one of --replace or --backup.")
+        return 2
+
+    source_path = Path(args.from_path)
+    link_path = Path(args.to_path)
+
+    try:
+        source_info = classify_source(source_path)
+        explain_source(source_info)
+
+        plan = choose_plan(source_path, link_path, args)
+        validate_plan(plan)
+
+        if report_already_correct(plan):
+            return 0
+
+        print_summary(plan)
+
+        if args.dry_run:
+            print("Dry run only. No changes made.")
+            return 0
+
+        if not maybe_confirm(plan, args):
+            print("Cancelled.")
+            return 1
+
+        apply_existing_destination_policy(plan)
+        create_link(plan)
+        print("Done.")
+        return 0
+
+    except KeyboardInterrupt:
+        print()
+        print("Cancelled.")
+        return 1
+    except (ValueError, FileNotFoundError, NotADirectoryError, FileExistsError) as exc:
+        eprint(f"Error: {exc}")
+        return 2
+    except OSError as exc:
+        eprint(f"Filesystem error: {exc}")
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
