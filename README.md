@@ -85,6 +85,24 @@ lnk [--yes] [--dry-run] [--replace | --backup] from to
 * `from` — source path
 * `to` — link path to create
 
+```bash
+lnk --help
+usage: lnk [-h] [--yes] [--dry-run] [--replace] [--backup] from_path to_path
+
+Create a symbolic link or hard link using an interactive wizard. By default, symlinks are preferred. Hard links are only created after explicit user choice in interactive mode.
+
+positional arguments:
+  from_path   Source path
+  to_path     Link path to create
+
+options:
+  -h, --help  show this help message and exit
+  --yes       Run non-interactively where possible. This auto-accepts defaults, but does not replace an existing destination unless --replace or --backup is also given.
+  --dry-run   Show the planned action without changing the filesystem.
+  --replace   Replace an existing destination without asking.
+  --backup    Backup an existing destination before replacing it.
+```
+
 ---
 
 ## Examples
