@@ -38,13 +38,13 @@ Creating links in Linux is simple, but the mental model is not:
 Clone the repository and link the script into your `PATH`:
 
 ```bash
-lnk ./lnk ~/bin/lnk
+./lnk ./lnk ~/bin/lnk
 ```
 
 Or non-interactively:
 
 ```bash
-lnk --yes --replace ./lnk ~/bin/lnk
+./lnk --yes --replace ./lnk ~/bin/lnk
 ```
 
 Make sure `~/bin` is in your `PATH`.
