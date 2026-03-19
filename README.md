@@ -70,7 +70,6 @@ Equivalent command:
   ln -s /home/user/dev/python/lnk/lnk /home/user/bin/lnk
 
 Done.
-➜  python/lnk (main)
 ```
 
 Make sure `~/bin` is in your `PATH`.
