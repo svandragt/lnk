@@ -38,13 +38,39 @@ Creating links in Linux is simple, but the mental model is not:
 Clone the repository and link the script into your `PATH`:
 
 ```bash
-./lnk ./lnk ~/bin/lnk
+$ ./lnk ./lnk ~/bin/lnk
 ```
 
 Or non-interactively:
 
 ```bash
-./lnk --yes --replace ./lnk ~/bin/lnk
+$ ./lnk --yes --replace ./lnk ~/bin/lnk
+Detected source:
+  Input path:    lnk
+  Absolute path: /home/user/dev/python/lnk/lnk
+  Kind:          file
+
+
+Planned action
+
+Source input:      lnk
+Source absolute:   /home/user/dev/python/lnk/lnk
+Link path:         /home/user/bin/lnk
+Link type:         symlink
+Path style:        absolute
+Resolved target:   /home/user/dev/python/lnk/lnk
+Stored target:     /home/user/dev/python/lnk/lnk
+Conflict action:   none
+
+Why these options were chosen:
+  - Non-interactive mode defaults regular files to symbolic links.
+  - Non-interactive mode defaults symbolic links to absolute paths.
+
+Equivalent command:
+  ln -s /home/user/dev/python/lnk/lnk /home/user/bin/lnk
+
+Done.
+➜  python/lnk (main)
 ```
 
 Make sure `~/bin` is in your `PATH`.
