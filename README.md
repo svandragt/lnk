@@ -38,7 +38,38 @@ Creating links in Linux is simple, but the mental model is not:
 Clone the repository and link the script into your `PATH`:
 
 ```bash
-$ ./lnk ./lnk ~/bin/lnk
+$ ./lnk  ./lnk ~/bin/lnk
+Detected source:
+  Input path:    lnk
+  Absolute path: /home/user/dev/python/lnk/lnk
+  Kind:          file
+
+How should the new path behave?
+Choose the behavior you want:
+  1. Like a reference or shortcut to the source [default]
+  2. Like a second name for the same file
+> 1
+Should this link keep working if this folder structure moves together? [Y/n]
+
+Planned action
+
+Source input:      lnk
+Source absolute:   /home/user/dev/python/lnk/lnk
+Link path:         /home/user/bin/lnk
+Link type:         symlink
+Path style:        relative
+Resolved target:   /home/user/dev/python/lnk/lnk
+Stored target:     ../dev/python/lnk/lnk
+Conflict action:   none
+
+Why these options were chosen:
+  - You chose reference-style behavior, so a symbolic link is appropriate.
+  - You said the paths may move together, so a relative symlink is appropriate.
+
+Equivalent command:
+  ln -s ../dev/python/lnk/lnk /home/user/bin/lnk
+
+Proceed with this action? [Y/n]
 ```
 
 Or non-interactively:
