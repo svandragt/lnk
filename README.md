@@ -202,4 +202,4 @@ Run directly:
 
 ## License
 
-MIT (or choose your preferred license)
+MIT
